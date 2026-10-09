@@ -54,6 +54,7 @@ class CosyVoiceModel:
         assert self.stream_scale_factor >= 1, 'stream_scale_factor should be greater than 1, change it according to your actual rtf'
         self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
         self.lock = threading.Lock()
+        self.token_condition = threading.Condition()
         # dict used to store session related variable
         self.tts_speech_token_dict = {}
         self.llm_end_dict = {}
@@ -125,12 +126,18 @@ class CosyVoiceModel:
                         continue
                 else:
                     cur_silent_token_num = 0
-                self.tts_speech_token_dict[uuid].append(i)
-        self.llm_end_dict[uuid] = True
+                with self.token_condition:
+                    self.tts_speech_token_dict[uuid].append(i)
+                    self.token_condition.notify_all()
+        with self.token_condition:
+            self.llm_end_dict[uuid] = True
+            self.token_condition.notify_all()
 
     def vc_job(self, source_speech_token, uuid):
         self.tts_speech_token_dict[uuid] = source_speech_token.flatten().tolist()
-        self.llm_end_dict[uuid] = True
+        with self.token_condition:
+            self.llm_end_dict[uuid] = True
+            self.token_condition.notify_all()
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, uuid, finalize=False, speed=1.0):
         with torch.cuda.amp.autocast(self.fp16):
@@ -268,6 +275,7 @@ class CosyVoice2Model(CosyVoiceModel):
         # rtf and decoding related
         self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
         self.lock = threading.Lock()
+        self.token_condition = threading.Condition()
         # dict used to store session related variable
         self.tts_speech_token_dict = {}
         self.llm_end_dict = {}
@@ -344,8 +352,13 @@ class CosyVoice2Model(CosyVoiceModel):
             token_offset = 0
             prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / self.token_hop_len) * self.token_hop_len - flow_prompt_speech_token.shape[1])
             while True:
-                time.sleep(0.1)
                 this_token_hop_len = self.token_hop_len + prompt_token_pad if token_offset == 0 else self.token_hop_len
+                with self.token_condition:
+                    self.token_condition.wait_for(
+                        lambda: self.llm_end_dict[this_uuid] or
+                        len(self.tts_speech_token_dict[this_uuid]) - token_offset >=
+                        this_token_hop_len + self.flow.pre_lookahead_len,
+                        timeout=0.1)
                 if len(self.tts_speech_token_dict[this_uuid]) - token_offset >= this_token_hop_len + self.flow.pre_lookahead_len:
                     this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_offset + this_token_hop_len + self.flow.pre_lookahead_len]).unsqueeze(dim=0)
                     this_tts_speech = self.token2wav(token=this_tts_speech_token,
@@ -415,6 +428,7 @@ class CosyVoice3Model(CosyVoice2Model):
         # rtf and decoding related
         self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
         self.lock = threading.Lock()
+        self.token_condition = threading.Condition()
         # dict used to store session related variable
         self.tts_speech_token_dict = {}
         self.llm_end_dict = {}
